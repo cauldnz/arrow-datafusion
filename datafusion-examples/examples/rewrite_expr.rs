@@ -20,7 +20,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
-    AggregateUDF, Between, Expr, Filter, LogicalPlan, ScalarUDF, TableSource, WindowUDF,
+    AggregateUDF, Between, Expr, Filter, LogicalPlan, ScalarUDF, TableSource, WindowUDF, Operator, col, lit, TableScan,
 };
 use datafusion_optimizer::analyzer::{Analyzer, AnalyzerRule};
 use datafusion_optimizer::optimizer::Optimizer;
@@ -35,7 +35,7 @@ use std::sync::Arc;
 pub fn main() -> Result<()> {
     // produce a logical plan using the datafusion-sql crate
     let dialect = PostgreSqlDialect {};
-    let sql = "SELECT * FROM person WHERE age BETWEEN 21 AND 32";
+    let sql = "SELECT * FROM person WHERE age BETWEEN 21 AND 32 AND 'foo' IN ('bar', 'foo')";
     let statements = Parser::parse_sql(&dialect, sql)?;
 
     // produce a logical plan using the datafusion-sql crate
@@ -50,23 +50,35 @@ pub fn main() -> Result<()> {
     // run the analyzer with our custom rule
     let config = OptimizerContext::default().with_skip_failing_rules(false);
     let analyzer = Analyzer::with_rules(vec![Arc::new(MyAnalyzerRule {})]);
-    let analyzed_plan =
+    let analyzed_plan1 =
         analyzer.execute_and_check(&logical_plan, config.options(), |_, _| {})?;
     println!(
-        "Analyzed Logical Plan:\n\n{}\n",
-        analyzed_plan.display_indent()
+        "Analyzed Logical Plan using MyAnalyzerRule:\n\n{}\n",
+        analyzed_plan1.display_indent()
     );
 
+    // run the analyzer with our custom rule
+    let config = OptimizerContext::default().with_skip_failing_rules(false);
+    let analyzer = Analyzer::with_rules(vec![Arc::new(RowConstraintAnalyzerRule {})]);
+    let analyzed_plan2 =
+        analyzer.execute_and_check(&analyzed_plan1, config.options(), |_, _| {})?;
+    println!(
+        "Analyzed Logical Plan using RowConstraintAnalyzerRule:\n\n{}\n",
+        analyzed_plan2.display_indent_schema()
+    );
+
+    
     // then run the optimizer with our custom rule
     let optimizer = Optimizer::with_rules(vec![Arc::new(MyOptimizerRule {})]);
-    let optimized_plan = optimizer.optimize(&analyzed_plan, &config, observe)?;
+    let optimized_plan = optimizer.optimize(&analyzed_plan2, &config, observe)?;
     println!(
         "Optimized Logical Plan:\n\n{}\n",
         optimized_plan.display_indent()
     );
-
+     
     Ok(())
 }
+
 
 fn observe(plan: &LogicalPlan, rule: &dyn OptimizerRule) {
     println!(
@@ -74,6 +86,52 @@ fn observe(plan: &LogicalPlan, rule: &dyn OptimizerRule) {
         rule.name(),
         plan.display_indent()
     )
+}
+
+
+/// An analyzer rule that checks for use of a particular table and constrains that query by adding a filter
+struct RowConstraintAnalyzerRule {}
+
+impl AnalyzerRule for RowConstraintAnalyzerRule {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        Self::analyze_plan(plan)
+    }
+
+    fn name(&self) -> &str {
+        "row_constraint_rule"
+    }
+}
+
+impl RowConstraintAnalyzerRule{
+    fn analyze_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
+        plan.transform(&|plan| {
+            Ok(match plan {
+                LogicalPlan::TableScan(mut filter_plan) => {
+                    let filter_expression = col("person.id").eq(lit(42u64));
+                    filter_plan.filters.push(filter_expression);
+                    Transformed::Yes(LogicalPlan::TableScan(filter_plan))
+                }
+                _ => Transformed::No(plan),
+            })
+        })
+    }
+
+
+    fn analyze_expr(expr: Expr) -> Result<Expr> {
+        expr.transform(&|expr| {
+            // closure is invoked for all sub expressions
+            Ok(match expr {
+                Expr::Literal(ScalarValue::Int64(i)) => {
+                    // transform to UInt64
+                    Transformed::Yes(Expr::Literal(ScalarValue::UInt64(
+                        i.map(|i| i as u64),
+                    )))
+                }
+                _ => Transformed::No(expr),
+            })
+        })
+    }
+
 }
 
 /// An example analyzer rule that changes Int64 literals to UInt64
